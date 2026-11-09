@@ -1,0 +1,95 @@
+name: Generate SBOM and Scan
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  build-sbom:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build and unpack the Python wheel
+        run: |
+          python3 -m pip wheel . --no-deps --wheel-dir dist
+          mkdir -p dist/unpacked
+          unzip -q dist/*.whl -d dist/unpacked
+
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          path: dist/unpacked
+          format: spdx-json
+          output-file: sbom.spdx.json
+          upload-artifact: false
+
+      - name: Generate CycloneDX SBOM
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          path: dist/unpacked
+          format: cyclonedx-json
+          output-file: sbom.cyclonedx.json
+          upload-artifact: false
+
+      - name: Add supplier and wheel checksum to SBOMs
+        run: |
+          python3 - <<'PY'
+          import glob
+          import hashlib
+          import json
+          from pathlib import Path
+
+          wheel = Path(glob.glob("dist/*.whl")[0])
+          digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+
+          spdx_path = Path("sbom.spdx.json")
+          spdx = json.loads(spdx_path.read_text())
+          package = next(
+              item for item in spdx["packages"]
+              if item.get("name") == "student-tools"
+              and any(ref.get("referenceType") == "purl" for ref in item.get("externalRefs", []))
+          )
+          package["supplier"] = "Organization: student-tools contributors"
+          package["checksums"] = [{"algorithm": "SHA256", "checksumValue": digest}]
+          spdx_path.write_text(json.dumps(spdx, indent=2) + "\n")
+
+          cdx_path = Path("sbom.cyclonedx.json")
+          cdx = json.loads(cdx_path.read_text())
+          package = next(
+              item for item in cdx["components"]
+              if item.get("purl", "").startswith("pkg:pypi/student-tools@")
+          )
+          package["supplier"] = {"name": "student-tools contributors"}
+          package["hashes"] = [{"alg": "SHA-256", "content": digest}]
+          cdx_path.write_text(json.dumps(cdx, indent=2) + "\n")
+          PY
+
+      - name: Scan SPDX SBOM with Grype
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+        with:
+          sbom: sbom.spdx.json
+          output-format: json
+          output-file: grype.json
+          fail-build: true
+
+      - name: Upload SBOM and scan reports
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: project-sbom-reports
+          path: |
+            sbom.spdx.json
+            sbom.cyclonedx.json
+            grype.json
+          if-no-files-found: warn
